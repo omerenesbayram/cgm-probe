@@ -3,6 +3,86 @@ import 'package:flutter/services.dart';
 
 import '../ble/sensor_controller.dart';
 import '../cgm/cgm_parser.dart';
+import 'glucose_chart.dart';
+
+/// The list under the graph shows only the newest readings; a recording
+/// grows by 288 a day.
+const _shownReadings = 100;
+
+/// pair: pair now (Pair / Re-pair); otherwise keep the existing pairing.
+/// pin: entered PIN, also kept for pairing again automatically later.
+typedef _PairResult = ({bool pair, String? pin});
+
+/// Asks for the PIN before connecting, like mySugr does. Owns its text
+/// controller so it lives until the dialog's closing animation is done.
+class _PairDialog extends StatefulWidget {
+  const _PairDialog({required this.paired});
+
+  final bool paired;
+
+  @override
+  State<_PairDialog> createState() => _PairDialogState();
+}
+
+class _PairDialogState extends State<_PairDialog> {
+  final _pin = TextEditingController();
+
+  @override
+  void dispose() {
+    _pin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pin = _pin.text.trim();
+    return AlertDialog(
+      title: Text(widget.paired ? 'Already paired' : 'Pair this phone?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(widget.paired
+              ? 'This phone was paired with the sensor before. If the sensor '
+                  'has been paired with another phone since then, choose '
+                  'Re-pair.\n\nEnter the PIN either way: some phones need it '
+                  'to pair again on their own when the sensor changes its '
+                  'Bluetooth address.'
+              : 'The sensor keeps only one pairing. Pairing this phone moves '
+                  'the sensor away from the phone that runs mySugr.'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _pin,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration:
+                const InputDecoration(labelText: 'PIN from the applicator cap'),
+            onChanged: (_) => setState(() {}),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        if (widget.paired)
+          TextButton(
+            onPressed: () => Navigator.pop(
+                context, (pair: false, pin: pin.isEmpty ? null : pin)),
+            child: const Text('Use pairing'),
+          ),
+        FilledButton(
+          onPressed: pin.isEmpty
+              ? null
+              : () => Navigator.pop(context, (pair: true, pin: pin)),
+          child: Text(widget.paired ? 'Re-pair' : 'Pair'),
+        ),
+      ],
+    );
+  }
+}
 
 class ProbeScreen extends StatefulWidget {
   const ProbeScreen({super.key});
@@ -15,40 +95,62 @@ class _ProbeScreenState extends State<ProbeScreen> {
   final controller = SensorController();
 
   @override
+  void initState() {
+    super.initState();
+    controller.init(); // reconnects to the remembered sensor, if any
+  }
+
+  Future<void> _forget() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Forget sensor?'),
+        content: const Text(
+          'The app disconnects and stops reconnecting to this sensor when it '
+          'starts. The recording is kept. To use the sensor again, find it '
+          'and connect.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Forget'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await controller.forgetSensor();
+  }
+
+  @override
   void dispose() {
     controller.dispose();
     super.dispose();
   }
 
+  /// Tapping a sensor stops the search right away. On Android, pairing asks
+  /// for the PIN first (like mySugr) and the app enters it the moment the
+  /// sensor requests it.
   Future<void> _connect(FoundSensor s) async {
-    if (await controller.needsNewPairing(s)) {
-      if (!mounted) return;
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Pair this phone?'),
-          content: const Text(
-            'This phone is not paired with the sensor yet. Connecting will '
-            'show a PIN prompt and pair it.\n\n'
-            'The sensor may then stop talking to the phone that runs mySugr. '
-            'Only continue if you accept that, for example near the end of '
-            'the sensor\'s 14 days.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Pair'),
-            ),
-          ],
-        ),
-      );
-      if (ok != true) return;
-    }
-    await controller.connect(s);
+    await controller.stopSearch();
+    final paired = await controller.androidPaired(s);
+    if (paired == null) return controller.connect(s);
+    if (!mounted) return;
+
+    final result = await showDialog<_PairResult>(
+      context: context,
+      builder: (context) => _PairDialog(paired: paired),
+    );
+    if (result == null) return;
+    await controller.connect(
+      s,
+      pin: result.pin,
+      forgetFirst: paired && result.pair,
+      usePairing: paired && !result.pair,
+    );
   }
 
   Future<void> _copy(String label, String text) async {
@@ -64,6 +166,7 @@ class _ProbeScreenState extends State<ProbeScreen> {
       listenable: controller,
       builder: (context, _) {
         final live = controller.state == ProbeState.connected ||
+            controller.state == ProbeState.reconnecting ||
             controller.state == ProbeState.demo;
         return Scaffold(
           appBar: AppBar(
@@ -92,8 +195,8 @@ class _ProbeScreenState extends State<ProbeScreen> {
   }
 
   Widget _searchView(BuildContext context) {
-    final searching = controller.state == ProbeState.searching;
-    final busy = searching || controller.state == ProbeState.connecting;
+    final connecting = controller.state == ProbeState.connecting;
+    final busy = connecting || controller.state == ProbeState.searching;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -108,7 +211,7 @@ class _ProbeScreenState extends State<ProbeScreen> {
             ),
             const SizedBox(width: 12),
             OutlinedButton(
-              onPressed: busy ? null : controller.startDemo,
+              onPressed: busy ? null : controller.startDemoSearch,
               child: const Text('Demo'),
             ),
           ],
@@ -127,12 +230,15 @@ class _ProbeScreenState extends State<ProbeScreen> {
           Card(
             child: ListTile(
               leading: const Icon(Icons.sensors),
-              title: Text(s.name.isEmpty ? s.device.remoteId.str : s.name),
-              subtitle: Text(s.alreadyConnected
-                  ? 'Already connected to this phone (shared with mySugr)'
-                  : 'Advertising, ${s.rssi} dBm'),
+              title: Text(s.name.isEmpty ? s.device!.remoteId.str : s.name),
+              subtitle: Text(s.simulated
+                  ? 'Simulated sensor (demo)'
+                  : s.alreadyConnected
+                      ? 'Already connected to this phone (shared with mySugr)'
+                      : 'Advertising, ${s.rssi} dBm'),
               trailing: const Icon(Icons.chevron_right),
-              onTap: busy ? null : () => _connect(s),
+              // Tappable while searching; the tap stops the search.
+              onTap: connecting ? null : () => _connect(s),
             ),
           ),
       ],
@@ -154,6 +260,53 @@ class _ProbeScreenState extends State<ProbeScreen> {
                 : _latestReading(theme, latest),
           ),
         ),
+        if (latest != null && controller.message != null)
+          Card(
+            child: ListTile(
+              leading: controller.state == ProbeState.reconnecting ||
+                      controller.historyBusy
+                  ? const SizedBox.square(
+                      dimension: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2.5),
+                    )
+                  : const Icon(Icons.info_outline),
+              title: Text(controller.message!),
+            ),
+          ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 16, 16, 8),
+            child: GlucoseChart(readings: controller.readings),
+          ),
+        ),
+        if (controller.state != ProbeState.demo)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: controller.canDownloadHistory &&
+                          !controller.historyBusy
+                      ? controller.downloadHistory
+                      : null,
+                  icon: const Icon(Icons.history),
+                  label: Text(controller.historyBusy
+                      ? 'Downloading...'
+                      : 'Download stored readings (last 8 h)'),
+                ),
+                if (controller.recorder != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      'Recording ${controller.recorder!.count} readings to '
+                      '${controller.recorder!.file.path}',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+              ],
+            ),
+          ),
         if (controller.info.isNotEmpty)
           Card(
             child: ExpansionTile(
@@ -170,27 +323,37 @@ class _ProbeScreenState extends State<ProbeScreen> {
           ),
         Padding(
           padding: const EdgeInsets.fromLTRB(4, 16, 4, 4),
-          child: Text('Readings (${controller.readings.length})',
+          child: Text(
+              controller.readings.length > _shownReadings
+                  ? 'Readings (${controller.readings.length}, '
+                      'latest $_shownReadings shown)'
+                  : 'Readings (${controller.readings.length})',
               style: theme.textTheme.titleMedium),
         ),
-        for (final r in controller.readings)
+        for (final r in controller.readings.take(_shownReadings))
           ListTile(
             dense: true,
-            leading: Text(r.measurement.glucoseLabel,
-                style: theme.textTheme.titleLarge),
+            leading: SizedBox(
+              width: 56,
+              child: Text(r.measurement.glucoseLabel,
+                  textAlign: TextAlign.end,
+                  style: theme.textTheme.titleLarge),
+            ),
             title: Text(r.sensorTime == null
-                ? 'Received ${formatTime(r.receivedAt)}'
-                : 'Sensor time ${formatTime(r.sensorTime!.toLocal())}'),
+                ? 'Received ${formatDayTime(r.receivedAt)}'
+                : 'Sensor time ${formatDayTime(r.sensorTime!.toLocal())}'),
             subtitle: Text(hex(r.measurement.raw),
                 style: const TextStyle(fontFamily: 'monospace')),
           ),
         const SizedBox(height: 16),
         OutlinedButton.icon(
-          onPressed: controller.disconnect,
+          onPressed: controller.state == ProbeState.demo
+              ? controller.stopDemo
+              : _forget,
           icon: const Icon(Icons.link_off),
           label: Text(controller.state == ProbeState.demo
               ? 'Stop demo'
-              : 'Disconnect'),
+              : 'Forget sensor'),
         ),
       ],
     );

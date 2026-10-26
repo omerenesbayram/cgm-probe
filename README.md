@@ -8,14 +8,42 @@ meal + glucose app; it is a developer tool, not a medical device.
 
 1. **Find sensor**: lists SmartGuide sensors (`AC-<serial>`) that are either
    - already connected to this phone by another app such as mySugr (shared connection), or
-   - advertising nearby.
-2. **Connect**: reads device info, CGM Feature, Session Start Time, Session Run Time and Status.
-3. **Listen**: subscribes to CGM Measurement and shows each reading (every 5 min).
-4. **Copy**: the toolbar buttons copy the readings (CSV) or the full log to the clipboard.
-5. **Demo**: plays back a real captured reading, then fake data, to test the screens without a sensor.
+   - advertising nearby. The list can be tapped while the search is still running.
+2. **Pair (Android)**: asks for the PIN from the applicator cap *before* connecting, like
+   mySugr. The app answers Android's pairing request itself (`MainActivity.kt`), so the
+   system's own PIN dialog does not appear.
+3. **Connect**: reads CGM Feature, Session Start Time, Session Run Time, Status and device info,
+   then subscribes to CGM Measurement (a reading every 5 min).
+4. **Record**: every reading is appended to one file per sensor, in the replay format
+   (`lib/cgm/replay.dart`). On Android it is in
+   `/sdcard/Android/data/com.omerb.cgm_probe/files/recordings/<sensor>.txt` (`adb pull` works).
+5. **Catch up**: on every (re)connection the app asks the sensor for the readings it missed.
+   The sensor keeps only the **last 8 hours (96 readings)**. The button
+   "Download stored readings" asks for all of them.
+6. **Remember**: after the first connection the sensor is saved. Every launch reconnects,
+   reloads the recording and catches up, without any tap. A lost connection is retried
+   automatically. **Forget sensor** stops this (the phone pairing and recording are kept).
+7. **Background (Android)**: a foreground service ("Recording glucose" notification) keeps the
+   app alive with the screen off, until the app is closed.
+8. **Graph**: glucose over time with the 70–180 mg/dL range shaded.
+9. **Demo**: a simulated sensor goes through search, PIN entry and pairing, then replays
+   8 hours recorded from a real sensor (`assets/replay/smartguide_8h.txt`).
+10. **Copy**: the toolbar buttons copy the readings (CSV) or the full log to the clipboard.
 
-It never writes to the sensor's control points (RACP `2A52`, SOCP `2AAC`), so it
-cannot change sensor settings or calibration.
+The only thing the app writes to the sensor is a Record Access Control Point request for
+stored readings (what mySugr does to fill gaps). It never uses the settings control point
+(SOCP `2AAC`), so it cannot change sensor settings or calibration.
+
+### Sensor behaviour learned so far
+
+- **One pairing at a time** (CGM Feature: multiple bonds not supported). Pairing a new phone
+  moves the sensor away from the old one.
+- **Changing Bluetooth address** (resolvable private address). Phones with Bluetooth 4.2+
+  follow it; older ones (Nexus 6P, Android 8.1) appear to keep dialing the pairing-time address
+  and time out (error 133). The app then pairs again with the saved PIN, if the sensor is
+  nearby (this fallback is not yet confirmed on a device).
+- After a new pairing the sensor sometimes drops the link; the app reconnects.
+- mySugr can rewrite the Session Start Time (seen moving by 2 s after re-pairing an iPhone).
 
 ## Running it
 
@@ -56,7 +84,7 @@ applicator cap is the Bluetooth pairing passkey.
 | CGM Status | `2AA9` | minutes since start + 24-bit status |
 | Session Start Time | `2AAA` | UTC on the SmartGuide (time zone field 0) |
 | Session Run Time | `2AAB` | 336 h = 14 days |
-| RACP | `2A52` | history download (not used yet) |
+| RACP | `2A52` | stored readings: `01 01` all, `01 03 01 <offset>` newer than an offset; answers `06 00 01 01` |
 | SOCP | `2AAC` | sensor commands (not used) |
 
 Every record ends with an **E2E-CRC: CRC-16/MCRF4XX, little-endian**, verified against

@@ -1,5 +1,9 @@
+import 'dart:io';
+
 import 'package:cgm_probe/cgm/cgm_parser.dart';
 import 'package:cgm_probe/cgm/crc.dart';
+import 'package:cgm_probe/cgm/recorder.dart';
+import 'package:cgm_probe/cgm/replay.dart';
 import 'package:cgm_probe/cgm/sfloat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -111,6 +115,84 @@ void main() {
       expect(s.timeOffsetMinutes, 10348);
       expect(s.annunciation.labels, ['Calibration not allowed']);
       expect(s.crcValid, isTrue);
+    });
+  });
+
+  group('Recorded 8 hours (nRF Connect, 2026-10-26)', () {
+    final data = parseReplay(
+        File('assets/replay/smartguide_8h.txt').readAsStringSync());
+
+    test('real CGM Feature: single bond only, CRC enabled', () {
+      final f = data.feature!;
+      expect(f.multipleBondSupported, isFalse);
+      expect(f.e2eCrcSupported, isTrue);
+      expect(f.labels, containsAll(['Calibration', 'Trend information', 'Quality']));
+      expect(f.typeLabel, 'Interstitial fluid');
+    });
+
+    test('97 records, valid checksums, every 5 minutes', () {
+      final ms = [for (final r in data.records) ...parseMeasurements(r)];
+      expect(ms, hasLength(97));
+      expect(ms.every((m) => m.crcValid), isTrue);
+      for (var i = 1; i < ms.length; i++) {
+        expect(ms[i].timeOffsetMinutes - ms[i - 1].timeOffsetMinutes, 5);
+      }
+      // 10:05 to 18:05 in Turkey (UTC+3).
+      expect(ms.first.timeFrom(data.start), DateTime.utc(2026, 10, 26, 7, 5, 5));
+      expect(ms.last.timeFrom(data.start), DateTime.utc(2026, 10, 26, 15, 5, 5));
+    });
+
+    test('decodes the sensor\'s decimal values', () {
+      // BB F3: exponent -1, mantissa 955.
+      expect(parseMeasurements(data.records.first).single.glucoseMgDl,
+          closeTo(95.5, 1e-9));
+    });
+  });
+
+  group('Recorder', () {
+    final data = parseReplay(
+        File('assets/replay/smartguide_8h.txt').readAsStringSync());
+    final ms = [for (final r in data.records) ...parseMeasurements(r)];
+
+    test('writes a file that replays, without duplicate readings', () async {
+      final dir = Directory.systemTemp.createTempSync('cgm_rec');
+      addTearDown(() => dir.deleteSync(recursive: true));
+
+      final rec = await Recorder.open(dir, 'AC-TEST');
+      expect(rec.previous, isNull);
+      rec.writeStart(sessionStart);
+      rec.writeFeature(parseHex('C19B01590052'));
+      ms.forEach(rec.add);
+      ms.take(10).forEach(rec.add); // a history download overlapping live data
+      await rec.flush();
+
+      expect(rec.count, 97);
+      final back = parseReplay(rec.file.readAsStringSync());
+      expect(back.records, hasLength(97));
+      expect(back.start.utc, DateTime.utc(2026, 10, 13, 8, 55, 5));
+      expect(back.feature!.multipleBondSupported, isFalse);
+      expect(back.records.last, data.records.last);
+    });
+
+    test('a new session continues the same file', () async {
+      final dir = Directory.systemTemp.createTempSync('cgm_rec');
+      addTearDown(() => dir.deleteSync(recursive: true));
+
+      final first = await Recorder.open(dir, 'AC-TEST');
+      first.writeStart(sessionStart);
+      ms.take(60).forEach(first.add);
+      await first.flush();
+
+      // App restarted: reopen, reconnect, download overlapping history.
+      final second = await Recorder.open(dir, 'AC-TEST');
+      expect(second.previous!.records, hasLength(60));
+      expect(second.count, 60);
+      second.writeStart(sessionStart);
+      ms.forEach(second.add);
+      await second.flush();
+
+      expect(second.count, 97);
+      expect(parseReplay(second.file.readAsStringSync()).records, hasLength(97));
     });
   });
 
