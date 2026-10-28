@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../ble/background.dart';
 import '../ble/sensor_controller.dart';
 import '../cgm/cgm_parser.dart';
 import 'glucose_chart.dart';
@@ -10,7 +11,8 @@ import 'glucose_chart.dart';
 const _shownReadings = 100;
 
 /// pair: pair now (Pair / Re-pair); otherwise keep the existing pairing.
-/// pin: entered PIN, also kept for pairing again automatically later.
+/// pin: entered PIN; once it pairs, it is kept for pairing again
+/// automatically later.
 typedef _PairResult = ({bool pair, String? pin});
 
 /// Asks for the PIN before connecting, like mySugr does. Owns its text
@@ -44,10 +46,8 @@ class _PairDialogState extends State<_PairDialog> {
         children: [
           Text(widget.paired
               ? 'This phone was paired with the sensor before. If the sensor '
-                  'has been paired with another phone since then, choose '
-                  'Re-pair.\n\nEnter the PIN either way: some phones need it '
-                  'to pair again on their own when the sensor changes its '
-                  'Bluetooth address.'
+                  'has been paired with another phone since then, enter the '
+                  'PIN and choose Re-pair.'
               : 'The sensor keeps only one pairing. Pairing this phone moves '
                   'the sensor away from the phone that runs mySugr.'),
           const SizedBox(height: 12),
@@ -69,8 +69,7 @@ class _PairDialogState extends State<_PairDialog> {
         ),
         if (widget.paired)
           TextButton(
-            onPressed: () => Navigator.pop(
-                context, (pair: false, pin: pin.isEmpty ? null : pin)),
+            onPressed: () => Navigator.pop(context, (pair: false, pin: null)),
             child: const Text('Use pairing'),
           ),
         FilledButton(
@@ -168,26 +167,35 @@ class _ProbeScreenState extends State<ProbeScreen> {
         final live = controller.state == ProbeState.connected ||
             controller.state == ProbeState.reconnecting ||
             controller.state == ProbeState.demo;
-        return Scaffold(
-          appBar: AppBar(
-            title: Text(live ? controller.deviceName : 'CGM Probe'),
-            actions: [
-              IconButton(
-                tooltip: 'Copy readings as CSV',
-                icon: const Icon(Icons.table_chart_outlined),
-                onPressed: controller.readings.isEmpty
-                    ? null
-                    : () => _copy('Readings', controller.readingsCsv()),
-              ),
-              IconButton(
-                tooltip: 'Copy log',
-                icon: const Icon(Icons.copy_all_outlined),
-                onPressed: () => _copy('Log', controller.log.join('\n')),
-              ),
-            ],
-          ),
-          body: SafeArea(
-            child: live ? _liveView(context) : _searchView(context),
+        // While a sensor is kept, Back sends the app to the background like
+        // Home. Closing the app would end the recording but leave the
+        // "Recording glucose" notification up.
+        return PopScope(
+          canPop: !controller.keepsSensor,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) Background.moveAppToBack();
+          },
+          child: Scaffold(
+            appBar: AppBar(
+              title: Text(live ? controller.deviceName : 'CGM Probe'),
+              actions: [
+                IconButton(
+                  tooltip: 'Copy readings as CSV',
+                  icon: const Icon(Icons.table_chart_outlined),
+                  onPressed: controller.readings.isEmpty
+                      ? null
+                      : () => _copy('Readings', controller.readingsCsv()),
+                ),
+                IconButton(
+                  tooltip: 'Copy log',
+                  icon: const Icon(Icons.copy_all_outlined),
+                  onPressed: () => _copy('Log', controller.log.join('\n')),
+                ),
+              ],
+            ),
+            body: SafeArea(
+              child: live ? _liveView(context) : _searchView(context),
+            ),
           ),
         );
       },

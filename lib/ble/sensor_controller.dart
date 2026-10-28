@@ -97,13 +97,36 @@ class SensorController extends ChangeNotifier {
   /// automatically until the user forgets the sensor.
   bool _keep = false;
   bool _linking = false;
-  bool _reconnecting = false;
+
+  /// Bumped by [forgetSensor] and by each new [connect]. Work started for an
+  /// older generation stops at its next check instead of, say, saving a
+  /// sensor the user just forgot.
+  int _generation = 0;
+
+  /// The generation [_reconnectLoop] is running for, if any.
+  int? _loopGeneration;
 
   /// The remembered sensor's PIN, for pairing again on its own (see
-  /// [_connectKnown]).
+  /// [_connectKnown]). Only a PIN that paired successfully is kept.
   String? _pin;
 
+  /// Damaged readings are dropped, unless the sensor sends no checksum.
+  bool _crcRequired = true;
+
   String get deviceName => _sensorName ?? 'CGM Probe';
+
+  /// True while a sensor is remembered and kept connected.
+  bool get keepsSensor => _keep;
+
+  bool _current(int gen) => gen == _generation;
+
+  void _ensureCurrent(int gen) {
+    if (!_current(gen)) throw const _Cancelled();
+  }
+
+  static void _ensureConnected(BluetoothDevice d) {
+    if (!d.isConnected) throw StateError('Connection lost during setup');
+  }
 
   bool get canDownloadHistory => state == ProbeState.connected && _racp != null;
 
@@ -132,6 +155,7 @@ class SensorController extends ChangeNotifier {
     readings.clear();
     _sessionStart = null;
     _racp = null;
+    _crcRequired = true;
     recorder = null;
   }
 
@@ -151,8 +175,18 @@ class SensorController extends ChangeNotifier {
     _device = d;
     _watch(d);
     _keep = true;
-    await Background.start(saved.name);
     unawaited(_reconnectLoop());
+    // Not awaited: on Android 13+ it may first ask for the notification
+    // permission, and reconnecting should not wait for the answer.
+    unawaited(_startBackground(saved.name));
+  }
+
+  Future<void> _startBackground(String sensorName) async {
+    try {
+      await Background.start(sensorName);
+    } catch (e) {
+      _log('Could not start the background service: $e');
+    }
   }
 
   /// Finds the remembered sensor without scanning: Android looks it up in
@@ -305,24 +339,27 @@ class SensorController extends ChangeNotifier {
   /// [forgetFirst]: remove this phone's old pairing before pairing again,
   /// needed after the sensor has been paired with another phone.
   /// [usePairing]: the phone is already paired and the user chose to keep
-  /// that pairing ([pin] may still be given, for automatic re-pairing).
+  /// that pairing.
   Future<void> connect(FoundSensor s,
       {String? pin, bool forgetFirst = false, bool usePairing = false}) async {
     await stopSearch();
     if (s.simulated) return _connectDemo(s);
 
+    final gen = ++_generation;
     _keep = false;
     var d = s.device!;
     _device = d;
     _resetSession(s.name);
     final saved = await SavedSensor.load();
-    _pin = pin ?? (saved?.name == s.name ? saved?.pin : null);
+    // A typed PIN replaces this once it pairs (see _pairIfNeeded).
+    _pin = saved?.name == s.name ? saved?.pin : null;
     _set(ProbeState.connecting, 'Connecting to ${s.name}...');
 
     try {
       await _openRecording(s.name);
       if (usePairing) {
-        d = await _connectKnown(d, s.name);
+        // The user is watching: report a failure instead of re-pairing.
+        d = await _connectKnown(d, s.name, gen, mayRepair: false);
       } else {
         if (forgetFirst && Platform.isAndroid) {
           _log('Removing this phone\'s old pairing');
@@ -344,17 +381,24 @@ class SensorController extends ChangeNotifier {
         }
       }
       await _linkUp(d);
+      _ensureCurrent(gen);
 
       await SavedSensor(s.name, d.remoteId.str, _pin).save();
       _keep = true;
       _log('Remembered ${s.name}; it will reconnect automatically');
-      await Background.start(s.name);
+      unawaited(_startBackground(s.name));
+      // A drop between _linkUp's last check and _keep = true went unseen.
+      if (!d.isConnected && state == ProbeState.connected) _lost();
+    } on _Cancelled {
+      _log('Connect stopped: the sensor was forgotten');
     } catch (e) {
       _log('Connect failed: $e');
-      await d.disconnect();
+      if (!_current(gen)) return;
+      // _connectKnown may have moved on to the sensor's new address.
+      await _device?.disconnect();
       _set(
         ProbeState.idle,
-        usePairing && _pin == null
+        usePairing
             ? 'Could not connect: $e\n\nIf the sensor is nearby, this phone '
                 'may not be able to follow its changing address. Choose '
                 'Re-pair and enter the PIN; the app then pairs again on its '
@@ -370,8 +414,10 @@ class SensorController extends ChangeNotifier {
   /// with Bluetooth 4.2+ follow it in hardware; older ones such as the
   /// Nexus 6P (Bluetooth 4.1, Android 8.1) keep dialing the address from
   /// pairing time and time out with error 133. So when a direct connection
-  /// fails while the sensor is nearby, pair again with the saved PIN.
-  Future<BluetoothDevice> _connectKnown(BluetoothDevice d, String name) async {
+  /// fails while the sensor is nearby and [mayRepair] allows it, pair again
+  /// with the saved PIN.
+  Future<BluetoothDevice> _connectKnown(BluetoothDevice d, String name, int gen,
+      {required bool mayRepair}) async {
     _watch(d);
     try {
       await d.connect(
@@ -381,22 +427,23 @@ class SensorController extends ChangeNotifier {
     } catch (e) {
       _log('Direct connection failed: $e');
       final pin = _pin;
-      if (!Platform.isAndroid || pin == null) rethrow;
+      if (!Platform.isAndroid || pin == null || !mayRepair) rethrow;
 
       // Only touch the pairing when the sensor is in range; otherwise this
       // is just "out of range" and the pairing must stay.
       _progress('Looking for $name...');
       await _findByName(name);
+      _ensureCurrent(gen);
       _log('Sensor is nearby but unreachable at its old address; pairing '
           'again with the saved PIN');
       _progress('Pairing again with the saved PIN...');
       await d.removeBond();
       final fresh = await _findByName(name);
+      _ensureCurrent(gen);
       _device = fresh;
       _watch(fresh);
       await fresh.connect(license: License.nonprofit);
       await _pairIfNeeded(fresh, pin);
-      await SavedSensor(name, fresh.remoteId.str, pin).save();
       return fresh;
     }
   }
@@ -410,29 +457,46 @@ class SensorController extends ChangeNotifier {
       if (st == BluetoothConnectionState.disconnected &&
           _keep &&
           state == ProbeState.connected) {
-        _set(ProbeState.reconnecting,
-            'Connection lost. Reconnecting automatically...');
-        unawaited(_reconnectLoop());
+        _lost();
       }
     });
   }
 
+  void _lost() {
+    _set(ProbeState.reconnecting,
+        'Connection lost. Reconnecting automatically...');
+    unawaited(_reconnectLoop());
+  }
+
+  /// Re-pairing removes a working pairing first, and a single failed
+  /// connection can be a passing error 133 or timeout. So the reconnect
+  /// loop only re-pairs once this many direct attempts in a row have failed.
+  static const _repairAfterAttempts = 3;
+
   /// Reconnects to the remembered sensor until it works or the user forgets
   /// the sensor, waiting a little longer after each failed attempt.
   Future<void> _reconnectLoop() async {
-    if (_reconnecting) return;
-    _reconnecting = true;
+    final gen = _generation;
+    if (_loopGeneration == gen) return; // already running
+    _loopGeneration = gen;
+    bool stopped() => !_keep || !_current(gen);
     try {
-      for (var attempt = 1; _keep; attempt++) {
+      for (var attempt = 1; !stopped(); attempt++) {
         try {
-          final d = await _connectKnown(_device!, _sensorName!);
+          final start = _device!;
+          final d = await _connectKnown(start, _sensorName!, gen,
+              mayRepair: attempt >= _repairAfterAttempts);
           await _linkUp(d);
+          _ensureCurrent(gen);
+          if (d.remoteId != start.remoteId) {
+            await SavedSensor(_sensorName!, d.remoteId.str, _pin).save();
+          }
           return;
         } catch (e) {
           _log('Reconnect attempt $attempt failed: $e');
-          if (!_keep) return;
+          if (stopped()) return;
           await _device?.disconnect(); // drop a half set-up link
-          if (!_keep) return;
+          if (stopped()) return;
           final wait = Duration(seconds: min(60, 10 * attempt));
           _set(ProbeState.reconnecting,
               'Sensor not reachable. Trying again in ${wait.inSeconds} s.');
@@ -440,15 +504,17 @@ class SensorController extends ChangeNotifier {
         }
       }
     } finally {
-      _reconnecting = false;
+      if (_loopGeneration == gen) _loopGeneration = null;
     }
   }
 
   /// Everything after the link is up, for the first connection and every
   /// reconnection: read the sensor info, subscribe to readings, then
   /// download the readings missed while disconnected.
+  ///
+  /// Throws if the link drops on the way, so the caller tries again.
   Future<void> _linkUp(BluetoothDevice d) async {
-    if (_linking) return;
+    if (_linking) throw StateError('Link setup already running');
     _linking = true;
     try {
       _progress('Connected. Reading sensor info...');
@@ -485,6 +551,8 @@ class SensorController extends ChangeNotifier {
         }
         notifyListeners();
       }
+      // A drop during the catch-up or the reads above is only logged there.
+      _ensureConnected(d);
     } finally {
       _linking = false;
     }
@@ -519,6 +587,8 @@ class SensorController extends ChangeNotifier {
       throw StateError('Pairing failed. Check the PIN and try again.');
     }
     _log('Paired');
+    // Proven to work: keep it for pairing again on its own later.
+    if (pin != null) _pin = pin;
 
     // The SmartGuide sometimes closes the connection right after a new
     // pairing (seen 64 ms later on 2026-10-26). Wait briefly for that, then
@@ -575,6 +645,7 @@ class SensorController extends ChangeNotifier {
   }
 
   void _showFeature(CgmFeature f) {
+    _crcRequired = f.e2eCrcSupported;
     info['Features'] = f.labels.join(', ');
     info['Sample'] = '${f.typeLabel}, ${f.sampleLocationLabel}';
     info['Multiple bonds'] = f.multipleBondSupported ? 'Supported' : 'No';
@@ -601,7 +672,9 @@ class SensorController extends ChangeNotifier {
     try {
       final base = (Platform.isAndroid ? await getExternalStorageDirectory() : null) ??
           await getApplicationDocumentsDirectory();
-      final rec = await Recorder.open(Directory('${base.path}/recordings'), sensorName);
+      final rec = await Recorder.open(
+          Directory('${base.path}/recordings'), sensorName,
+          onWriteError: (e) => _log('Could not write the recording: $e'));
       recorder = rec;
       _log('Recording to ${rec.file.path} (${rec.count} readings so far)');
       final previous = rec.previous;
@@ -627,11 +700,17 @@ class SensorController extends ChangeNotifier {
     try {
       final now = DateTime.now();
       for (final m in parseMeasurements(value)) {
+        if (_crcRequired && !m.crcValid) {
+          // Damaged on the way. Keeping it would block the good copy, which
+          // the sensor still stores ("Download stored readings").
+          _log('  -> CRC BAD, skipped (offset ${m.timeOffsetMinutes} min)');
+          continue;
+        }
         recorder?.add(m);
         final added = _addReading(Reading(
             m, now, _sessionStart == null ? null : m.timeFrom(_sessionStart!)));
-        _log('  -> ${m.glucoseLabel} mg/dL, offset ${m.timeOffsetMinutes} min, '
-            'CRC ${m.crcValid ? 'ok' : 'BAD'}${added ? '' : ' (duplicate)'}');
+        _log('  -> ${m.glucoseLabel} mg/dL, offset ${m.timeOffsetMinutes} min'
+            '${added ? '' : ' (duplicate)'}');
       }
       if (!historyBusy && state == ProbeState.connected) message = null;
     } catch (e) {
@@ -702,12 +781,18 @@ class SensorController extends ChangeNotifier {
   }
 
   /// Sends one RACP request and returns the response code from the
-  /// `06 00 <op code> <response code>` indication.
+  /// `06 00 <op code> <response code>` indication. Fails right away if the
+  /// link drops.
   Future<int> _racpRequest(BluetoothCharacteristic racp, List<int> request) async {
     final response = Completer<List<int>>();
     final sub = racp.onValueReceived.listen((v) {
       if (v.isNotEmpty && v[0] == 0x06 && !response.isCompleted) {
         response.complete(v);
+      }
+    });
+    final conn = racp.device.connectionState.listen((st) {
+      if (st == BluetoothConnectionState.disconnected && !response.isCompleted) {
+        response.completeError(StateError('Disconnected'));
       }
     });
     try {
@@ -718,6 +803,7 @@ class SensorController extends ChangeNotifier {
       return r.length >= 4 ? r[3] : -1;
     } finally {
       await sub.cancel();
+      await conn.cancel();
     }
   }
 
@@ -772,6 +858,7 @@ class SensorController extends ChangeNotifier {
   /// pairing and the recording file are kept, so connecting again later
   /// needs no PIN and continues the same recording.
   Future<void> forgetSensor() async {
+    _generation++; // stops a connect or reconnect still in progress
     _keep = false;
     _pin = null;
     await _connSub?.cancel();
@@ -812,6 +899,14 @@ class SensorController extends ChangeNotifier {
     _connSub?.cancel();
     super.dispose();
   }
+}
+
+/// Thrown when the user forgot the sensor while work for it was running.
+class _Cancelled implements Exception {
+  const _Cancelled();
+
+  @override
+  String toString() => 'Stopped: the sensor was forgotten';
 }
 
 String _two(int n) => n.toString().padLeft(2, '0');

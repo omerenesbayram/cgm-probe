@@ -24,8 +24,11 @@ meal + glucose app; it is a developer tool, not a medical device.
    reloads the recording and catches up, without any tap. A lost connection is retried
    automatically. **Forget sensor** stops this (the phone pairing and recording are kept).
 7. **Background (Android)**: a foreground service ("Recording glucose" notification) keeps the
-   app alive with the screen off, until the app is closed.
-8. **Graph**: glucose over time with the 70–180 mg/dL range shaded.
+   app alive in the background and with the screen off. Despite its name, this is Android's
+   way of running in the background. While a sensor is remembered, Back on the main screen
+   sends the app to the background instead of closing it. Swiping the app away from the
+   recent apps stops recording.
+8. **Graph**: glucose over the last 24 hours with the 70–180 mg/dL range shaded.
 9. **Demo**: a simulated sensor goes through search, PIN entry and pairing, then replays
    8 hours recorded from a real sensor (`assets/replay/smartguide_8h.txt`).
 10. **Copy**: the toolbar buttons copy the readings (CSV) or the full log to the clipboard.
@@ -40,8 +43,9 @@ stored readings (what mySugr does to fill gaps). It never uses the settings cont
   moves the sensor away from the old one.
 - **Changing Bluetooth address** (resolvable private address). Phones with Bluetooth 4.2+
   follow it; older ones (Nexus 6P, Android 8.1) appear to keep dialing the pairing-time address
-  and time out (error 133). The app then pairs again with the saved PIN, if the sensor is
-  nearby (this fallback is not yet confirmed on a device).
+  and time out (error 133). After three failed direct attempts in a row, the app pairs again
+  with the saved PIN, but only if the sensor is nearby and that PIN has paired before (this
+  fallback is not yet confirmed on a device).
 - After a new pairing the sensor sometimes drops the link; the app reconnects.
 - mySugr can rewrite the Session Start Time (seen moving by 2 s after re-pairing an iPhone).
 

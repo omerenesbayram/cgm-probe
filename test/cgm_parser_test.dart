@@ -194,6 +194,33 @@ void main() {
       expect(second.count, 97);
       expect(parseReplay(second.file.readAsStringSync()).records, hasLength(97));
     });
+
+    test('keeps writing after a failed write', () async {
+      final dir = Directory.systemTemp.createTempSync('cgm_rec');
+      addTearDown(() {
+        if (dir.existsSync()) dir.deleteSync(recursive: true);
+      });
+
+      final errors = <Object>[];
+      final rec = await Recorder.open(dir, 'AC-TEST', onWriteError: errors.add);
+      rec.writeStart(sessionStart);
+      await rec.flush();
+
+      dir.deleteSync(recursive: true); // storage gone: the next write fails
+      rec.add(ms[0]);
+      await rec.flush();
+      expect(errors, hasLength(1));
+
+      dir.createSync();
+      rec.writeStart(sessionStart);
+      rec.add(ms[1]);
+      rec.add(ms[0]); // the lost reading, from a later history download
+      await rec.flush();
+
+      expect(errors, hasLength(1));
+      expect(parseReplay(rec.file.readAsStringSync()).records,
+          [data.records[1], data.records[0]]);
+    });
   });
 
   group('CGM Feature', () {

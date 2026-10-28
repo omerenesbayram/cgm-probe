@@ -5,8 +5,8 @@ import 'package:flutter/material.dart';
 
 import '../ble/sensor_controller.dart';
 
-/// Simple glucose line over sensor time, with the 70-180 mg/dL target
-/// range shaded. LO/HI/invalid readings are left out.
+/// Simple glucose line over sensor time for the last 24 hours, with the
+/// 70-180 mg/dL target range shaded. LO/HI/invalid readings are left out.
 class GlucoseChart extends StatelessWidget {
   const GlucoseChart({super.key, required this.readings});
 
@@ -15,6 +15,10 @@ class GlucoseChart extends StatelessWidget {
 
   static const _low = 70.0;
   static const _high = 180.0;
+
+  /// A recording can span the sensor's 14 days; more than a day does not
+  /// fit a phone-width graph.
+  static const _window = Duration(hours: 24);
 
   @override
   Widget build(BuildContext context) {
@@ -25,6 +29,10 @@ class GlucoseChart extends StatelessWidget {
           FlSpot(r.sensorTime!.millisecondsSinceEpoch.toDouble(),
               r.measurement.glucoseMgDl),
     ];
+    if (spots.isNotEmpty) {
+      final cutoff = spots.last.x - _window.inMilliseconds;
+      spots.removeWhere((s) => s.x < cutoff);
+    }
     if (spots.length < 2) {
       return const SizedBox(
         height: 120,
@@ -44,6 +52,10 @@ class GlucoseChart extends StatelessWidget {
             : span <= const Duration(hours: 12)
                 ? const Duration(hours: 2)
                 : const Duration(hours: 4);
+    // Time labels sit at baselineX + n * step. Local midnight puts them on
+    // round local hours (from 0 they would follow UTC: odd hours in UTC+3).
+    final last = DateTime.fromMillisecondsSinceEpoch(spots.last.x.round());
+    final midnight = DateTime(last.year, last.month, last.day);
     final small = theme.textTheme.bodySmall;
 
     return SizedBox(
@@ -52,6 +64,7 @@ class GlucoseChart extends StatelessWidget {
         LineChartData(
           minY: minY,
           maxY: maxY,
+          baselineX: midnight.millisecondsSinceEpoch.toDouble(),
           rangeAnnotations: RangeAnnotations(horizontalRangeAnnotations: [
             HorizontalRangeAnnotation(
               y1: _low,
@@ -101,7 +114,8 @@ class GlucoseChart extends StatelessWidget {
               getTooltipItems: (touched) => [
                 for (final t in touched)
                   LineTooltipItem(
-                    '${t.y.round()} mg/dL\n${_hhmm(t.x)}',
+                    '${t.y.round()} mg/dL\n'
+                    '${formatDayTime(DateTime.fromMillisecondsSinceEpoch(t.x.round()))}',
                     TextStyle(color: theme.colorScheme.onInverseSurface),
                   ),
               ],

@@ -1,11 +1,18 @@
 import 'dart:io' show Platform;
 
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
-/// Android foreground service that keeps the app process alive (screen off,
-/// app in the background) while a sensor is connected. The Bluetooth work
-/// itself stays in the app; the service only shows a notification and keeps
-/// Android from stopping the app. It ends when the app is closed.
+/// Native side: MainActivity.kt.
+const _appChannel = MethodChannel('cgm_probe/app');
+
+/// Keeps the app recording while it is in the background or the screen is
+/// off. On Android this takes a "foreground service": despite the name, that
+/// is how Android lets an app keep working in the background. It must show a
+/// notification, and in return Android does not stop the app the way it
+/// stops plain background work. The Bluetooth work itself stays in the app;
+/// the service only shows the notification and keeps the app alive. It ends
+/// when the app is swiped away from the recent apps.
 ///
 /// iOS needs no service: the bluetooth-central background mode in
 /// Info.plist lets the app receive readings in the background.
@@ -47,5 +54,11 @@ abstract final class Background {
   static Future<void> stop() async {
     if (!Platform.isAndroid) return;
     await FlutterForegroundTask.stopService();
+  }
+
+  /// Sends the app to the background like Home does, instead of closing it.
+  static Future<void> moveAppToBack() async {
+    if (!Platform.isAndroid) return;
+    await _appChannel.invokeMethod('moveToBack');
   }
 }

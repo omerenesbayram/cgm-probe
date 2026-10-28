@@ -26,7 +26,9 @@ class MainActivity : FlutterActivity() {
     private val pairingReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val pin = pendingPin ?: return
-            val device = if (Build.VERSION.SDK_INT >= 33) {
+            // The typed getParcelableExtra is unreliable on Android 13, so
+            // use it from 14 on, as androidx's IntentCompat does.
+            val device = if (Build.VERSION.SDK_INT >= 34) {
                 intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
             } else {
                 @Suppress("DEPRECATION")
@@ -61,6 +63,19 @@ class MainActivity : FlutterActivity() {
                     "clearPendingPin" -> {
                         pendingAddress = null
                         pendingPin = null
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // Back on the main screen while recording: go to the background
+        // instead of closing, which would stop the recording.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cgm_probe/app")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "moveToBack" -> {
+                        moveTaskToBack(true)
                         result.success(null)
                     }
                     else -> result.notImplemented()
